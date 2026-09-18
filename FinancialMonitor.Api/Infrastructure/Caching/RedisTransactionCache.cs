@@ -10,6 +10,24 @@ public sealed class RedisTransactionCache(IConnectionMultiplexer redis) : ITrans
     private const string TransactionsHashKey = "FinancialMonitor:transactions";
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromSeconds(30);
 
+    // Atomic compare-and-set: a read-then-write from C# has a race window where another
+    // pod's write can land between the read and the write, silently overwriting it. Doing
+    // the read, comparison, and write inside one Lua script makes Redis execute all three
+    // as a single atomic step, closing that window.
+    private static readonly LuaScript UpsertIfNewerScript = LuaScript.Prepare(
+        $$"""
+        local existing = redis.call('HGET', @key, @field)
+        if existing then
+            local ok, decoded = pcall(cjson.decode, existing)
+            if ok and decoded.{{nameof(Transaction.Version)}} ~= nil and tonumber(decoded.{{nameof(Transaction.Version)}}) >= tonumber(@version) then
+                return 0
+            end
+        end
+        redis.call('HSET', @key, @field, @value)
+        redis.call('HEXPIRE', @key, @ttlSeconds, 'FIELDS', 1, @field)
+        return 1
+        """);
+
     private IDatabase Database => redis.GetDatabase();
 
     public async Task<IReadOnlyCollection<Transaction>?> GetAsync(CancellationToken cancellationToken = default)
@@ -56,29 +74,15 @@ public sealed class RedisTransactionCache(IConnectionMultiplexer redis) : ITrans
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var existingEntry = await Database.HashGetAsync(TransactionsHashKey, transaction.TransactionId);
-        var existingTransaction = existingEntry.HasValue
-            ? JsonSerializer.Deserialize<Transaction>(existingEntry!)
-            : null;
-
-        if (IsStale(existingTransaction, transaction))
-        {
-            return;
-        }
-
-        var cacheUpdate = Database.CreateTransaction();
-        _ = cacheUpdate.HashSetAsync(
-            TransactionsHashKey,
-            transaction.TransactionId,
-            JsonSerializer.Serialize(transaction));
-        _ = cacheUpdate.HashFieldExpireAsync(
-            TransactionsHashKey,
-            [transaction.TransactionId],
-            CacheLifetime);
-
-        await cacheUpdate.ExecuteAsync();
+        await UpsertIfNewerScript.EvaluateAsync(
+            Database,
+            new
+            {
+                key = (RedisKey)TransactionsHashKey,
+                field = transaction.TransactionId,
+                value = JsonSerializer.Serialize(transaction),
+                version = transaction.Version,
+                ttlSeconds = (int)CacheLifetime.TotalSeconds
+            });
     }
-
-    public static bool IsStale(Transaction? existing, Transaction incoming) =>
-        existing is not null && existing.Version > incoming.Version;
 }
